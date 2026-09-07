@@ -173,6 +173,38 @@ async function fetchOnyxpagTransaction(transactionId) {
   return body.data;
 }
 
+// TEMPORÁRIO — descobrir o endpoint certo de consulta de status da OnyxPag.
+// REMOVER depois de achar. GET /api/_debug?id=<transaction id>&ext=<order id>
+app.get("/api/_debug", async (req, res) => {
+  const id = String(req.query.id || "");
+  const ext = String(req.query.ext || "");
+  const auth = onyxpagAuthHeader();
+  const tries = [
+    ["GET", `${ONYXPAG_BASE}?id=${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/?id=${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}?transaction_id=${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/transactions/${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/transaction/${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/transactions?id=${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/pix/${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/pix?id=${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}/v1/transactions/${encodeURIComponent(id)}`],
+    ["GET", `${ONYXPAG_BASE}?id=${encodeURIComponent(ext)}`],
+    ["GET", `${ONYXPAG_BASE}?external_ref=${encodeURIComponent(ext)}`],
+  ];
+  const out = [];
+  for (const [method, url] of tries) {
+    try {
+      const r = await fetch(url, { method, headers: { Authorization: auth }, signal: AbortSignal.timeout(8000) });
+      const text = await r.text();
+      out.push({ url, status: r.status, body: text.slice(0, 600) });
+    } catch (e) {
+      out.push({ url, error: e.message });
+    }
+  }
+  res.json(out);
+});
+
 // Depois de confirmar (via fetchOnyxpagTransaction) que uma transação está
 // paga de verdade, avisa a UTMify. Reconstrói o registro pelo external_ref
 // se o pedido não estiver mais em memória (restart no meio do checkout).
@@ -314,6 +346,7 @@ app.post("/api/pay", async (req, res) => {
 
     const pix = body.data;
     console.log("[onyxpag] cobrança criada", { orderId, transactionId: pix.id, status: pix.status });
+    console.log("[onyxpag] DEBUG resposta completa da criação:", JSON.stringify(body).slice(0, 1200)); // TEMP — remover
 
     // Endereço de entrega fica só com a gente — a OnyxPag não pede isso pra
     // processar o Pix, mas precisamos guardar pra despachar o produto depois.
