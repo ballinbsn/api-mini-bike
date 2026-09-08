@@ -75,11 +75,15 @@ function onyxpagAuthHeader() {
    a transação da OnyxPag ao nosso pedido, mesmo depois de um restart. */
 const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved"]);
 const FAILED_STATUSES = new Set(["expirado", "expired", "cancelado", "canceled", "cancelled"]);
-const ordersById = new Map(); // orderId (PED...) -> rec
+const ordersById = new Map();   // orderId (MBS...)      -> rec
+const ordersByTxId = new Map(); // transactionId (PXB_...) -> rec
+// A resposta GET /transactions/{id} da OnyxPag NÃO devolve o external_ref/
+// metadata, então religamos a transação ao nosso pedido por esse índice.
 
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const [k, v] of ordersById) if ((v.ts || 0) < cutoff) ordersById.delete(k);
+  for (const [k, v] of ordersByTxId) if ((v.ts || 0) < cutoff) ordersByTxId.delete(k);
 }, 60 * 60 * 1000).unref?.();
 
 async function sendUtmifyOrder(rec, status, approvedDate = null) {
@@ -179,10 +183,13 @@ async function fetchOnyxpagTransaction(transactionId) {
 // Depois de confirmar (via fetchOnyxpagTransaction) que uma transação está
 // paga de verdade, avisa a UTMify. Reconstrói o registro pelo external_ref
 // se o pedido não estiver mais em memória (restart no meio do checkout).
-async function handleConfirmedStatus(tx) {
+async function handleConfirmedStatus(tx, hintOrderId = null) {
   if (!tx) return;
-  const orderId = tx.external_ref || tx.external_id || null;
-  let rec = orderId ? ordersById.get(orderId) : null;
+  const orderId = hintOrderId || tx.external_ref || tx.external_id || null;
+  // 1) pelo nosso orderId (hint do webhook ou external_ref)  2) pelo id da
+  //    transação da OnyxPag (índice local)  3) reconstrói só com o que a
+  //    OnyxPag devolveu (restart no meio do checkout).
+  let rec = (orderId && ordersById.get(orderId)) || (tx.id && ordersByTxId.get(tx.id)) || null;
   if (!rec && orderId) {
     rec = {
       orderId,
@@ -232,7 +239,7 @@ app.post("/api/webhooks/onyxpag", async (req, res) => {
     console.warn("[onyxpag webhook] não confirmou a transação na consulta, ignorando", transactionId);
     return;
   }
-  await handleConfirmedStatus(tx);
+  await handleConfirmedStatus(tx, data?.external_id || null);
 });
 
 // Cria a cobrança Pix pro pedido
@@ -344,9 +351,11 @@ app.post("/api/pay", async (req, res) => {
         utm_content: t.utm_content || null,
         utm_term: t.utm_term || null,
       },
+      txId: pix.id,
       utmifySent: new Set(),
     };
     ordersById.set(orderId, rec);
+    ordersByTxId.set(pix.id, rec);
 
     sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
