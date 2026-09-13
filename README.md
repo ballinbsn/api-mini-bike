@@ -1,7 +1,7 @@
-# Checkout backend (OnyxPag + UTMify) — Mini Bike Ergométrica Sênior
+# Checkout backend (Adex + UTMify) — Mini Bike Ergométrica Sênior
 
-Backend Pix dedicado a uma oferta/funil. Veja o skill `onyxpag-utmify-checkout`
-pro playbook completo (gotchas, debugging, onde achar cada credencial).
+Backend Pix dedicado a uma oferta/funil. Migrado da OnyxPag pra **Adex**
+(gateway trocado, lógica de UTMify 100% preservada).
 
 ## Estado atual desta configuração
 
@@ -10,30 +10,49 @@ pro playbook completo (gotchas, debugging, onde achar cada credencial).
 | Repo GitHub | `ballinbsn/api-mini-bike` (branch `main`, auto-deploy ligado) |
 | Railway | projeto `precious-recreation` → serviço `api-mini-bike` |
 | Domínio | `https://api-mini-bike-production.up.railway.app` (porta 8080) |
-| Webhook | `https://api-mini-bike-production.up.railway.app/api/webhooks/onyxpag` |
+| Webhook | `https://api-mini-bike-production.up.railway.app/api/webhooks/adex` |
+| Front | `https://mini-bike.vercel.app/` |
 
-**Já criados no Railway** (aba Variables): `ONYXPAG_WEBHOOK_URL`, `PORT=8080` e os
-3 placeholders abaixo — **você só precisa colar os valores reais neles:**
+**Variáveis a configurar no Railway** (aba Variables) — as `ONYXPAG_*` antigas
+não são mais usadas, criar/trocar por:
 
-- `ONYXPAG_PUBLIC_KEY`  → hoje `COLE_AQUI_SUA_CHAVE_PUBLICA_ONYXPAG`
-- `ONYXPAG_PRIVATE_KEY` → hoje `COLE_AQUI_SUA_CHAVE_PRIVADA_ONYXPAG`
-- `UTMIFY_API_TOKEN`    → hoje `COLE_AQUI_SEU_TOKEN_UTMIFY`
+- `ADEX_PUBLIC_KEY` (painel Adex → Chaves de API)
+- `ADEX_SECRET_KEY` (painel Adex → Chaves de API — também valida a assinatura do webhook)
+- `ADEX_WEBHOOK_URL` = `https://api-mini-bike-production.up.railway.app/api/webhooks/adex`
+- `UTMIFY_API_TOKEN` (mantém o que já estava — não muda com a troca de gateway)
+- `PORT=8080` (mantém)
 
-**Falta:**
-1. `git push` deste código para `ballinbsn/api-mini-bike` (o commit já está pronto aqui).
-2. Colar os 3 valores reais nas variáveis acima (Railway → api-mini-bike → Variables → clicar em cada uma → editar).
-3. Cadastrar `https://api-mini-bike-production.up.railway.app/api/webhooks/onyxpag`
-   no painel da OnyxPag (aba Webhooks) também.
-4. (Opcional) criar `CORS_ORIGIN` com o domínio da landing quando ela estiver publicada.
+⚠️ **Se você conectar a integração nativa UTMify dentro do painel da Adex**
+(Integrações → UTMify), **desative** essa integração nativa ou remova
+`UTMIFY_API_TOKEN` daqui — rodando as duas juntas, a mesma venda é reportada
+**duas vezes** pra UTMify com order-ids diferentes (conta como 2 vendas na campanha).
 
-Depois disso: `curl https://api-mini-bike-production.up.railway.app/health` deve
-devolver `{"ok":true}`. O front (`assets/js/checkout.js`) já aponta para esse domínio.
+## O que mudou na migração
+
+| | OnyxPag (antes) | Adex (agora) |
+|---|---|---|
+| Auth | Basic (base64 chave pública:privada) | headers `x-public-key` + `x-secret-key` |
+| Criar Pix | `POST https://api.onyxpag.com` | `POST https://api.adex.cash/functions/v1/pix-receive` |
+| Consultar status | `GET /transactions/{id}` (path) | `GET /pix-receive?transaction_id={id}` (query) |
+| Religar pedido pago | `external_ref`/`external_id` ecoado pela gateway | **não dá** — a Adex ignora nosso `external_id` e devolve um UUID dela própria. Religação é só pelo `tx.id` que ELA gera na criação, guardado em `ordersByTxId` |
+| Assinatura de webhook | nenhuma documentada | HMAC-SHA256 (`x-webhook-signature: sha256=<hex>`), validada com `crypto.timingSafeEqual` — mas mesmo assinado, o webhook só dispara uma reconsulta, nunca decide sozinho |
+| QR Code pronto (imagem) | às vezes vinha (`pix_qr_code`) | nunca vem — só o copia-e-cola (`pix.copyPaste`). O front já sabe gerar a imagem a partir do código, nada muda lá |
+| `amount` | reais decimal; `items[].unitPrice` em **centavos** (inconsistente) | reais decimal em ambos (a confirmar no teste de R$1 — ver abaixo) |
+
+## ⚠️ Debug temporário ainda no código
+
+`server.js` tem 3 `console.log` marcados `// TEMP` que imprimem a resposta
+crua da Adex (criação, consulta de status, webhook). Ficam até o teste de
+R$1 confirmar que o parsing (`body.transaction`, `body.pix.copyPaste`,
+`body.pix.expiresAt`) bate com a resposta real — a doc da Adex já se mostrou
+inconsistente com o comportamento real em outro projeto, então não dá pra
+confiar sem testar. **Remover depois de confirmado.**
 
 | Method | Route | Uso |
 |---|---|---|
 | POST | /api/pay | cria a cobrança Pix |
 | GET | /api/pix-status?id= | consulta o status do pagamento (fonte de verdade) |
-| POST | /api/webhooks/onyxpag | webhook da OnyxPag — só um aviso, sempre reconsulta antes de confiar |
+| POST | /api/webhooks/adex | webhook da Adex — valida assinatura, mas sempre reconsulta antes de confiar |
 | GET | /health | healthcheck |
 
 ## Rodar localmente
@@ -52,6 +71,6 @@ npm run dev
 3. Railway → Variables → cole as variáveis do `.env.example` com os valores reais.
 4. Railway → Settings → Networking → Generate Domain.
 5. Confirme com `curl https://SEU-DOMINIO/health` → `{"ok":true}`.
-6. Preencha `ONYXPAG_WEBHOOK_URL` com esse domínio + `/api/webhooks/onyxpag` e salve (redeploy automático).
-7. Se a OnyxPag tiver um cadastro de webhook separado no painel dela, registre essa mesma URL lá.
-8. No front-end, aponte `BACKEND_URL` pra esse domínio do Railway.
+6. Preencha `ADEX_WEBHOOK_URL` com esse domínio + `/api/webhooks/adex` e salve (redeploy automático).
+7. Se a Adex tiver um cadastro de webhook separado no painel dela, registre essa mesma URL lá.
+8. No front-end, `BACKEND_URL` já aponta pra esse domínio do Railway — não muda com a troca de gateway.

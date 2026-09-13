@@ -1,10 +1,11 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ONYXPAG_BASE = "https://api.onyxpag.com";
+const ADEX_BASE = "https://api.adex.cash/functions/v1";
 const UTMIFY_ORDERS_URL = "https://api.utmify.com.br/api-credentials/orders";
 
 // CORS_ORIGIN: domínio(s) que podem chamar essa API, separados por vírgula.
@@ -25,11 +26,6 @@ function clientIp(req) {
 // Data no formato que a UTMify exige: "YYYY-MM-DD HH:MM:SS" em UTC.
 function utmifyDate(d = new Date()) {
   return d.toISOString().slice(0, 19).replace("T", " ");
-}
-
-// A OnyxPag quer o CPF formatado ("000.000.000-00"), não em dígitos crus.
-function formatCPF(digits) {
-  return digits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4");
 }
 
 // Gera um CPF com dígitos verificadores válidos — fallback quando o front não
@@ -56,10 +52,12 @@ function genPhone() {
   return ddd + num;
 }
 
-// Basic Auth exigido pela OnyxPag: base64("chave_publica:chave_privada").
-function onyxpagAuthHeader() {
-  const raw = `${process.env.ONYXPAG_PUBLIC_KEY || ""}:${process.env.ONYXPAG_PRIVATE_KEY || ""}`;
-  return "Basic " + Buffer.from(raw).toString("base64");
+// Auth da Adex: dois headers, não é Basic/Bearer.
+function adexAuthHeaders() {
+  return {
+    "x-public-key": process.env.ADEX_PUBLIC_KEY || "",
+    "x-secret-key": process.env.ADEX_SECRET_KEY || "",
+  };
 }
 
 /* ================================================================== */
@@ -69,16 +67,16 @@ function onyxpagAuthHeader() {
    orderId. A UTMify só dispara Purchase pro Meta no "paid".
 
    O pedido fica guardado em memória por 24h, indexado pelo nosso orderId
-   (prefixo "MBS" = Mini Bike Sênior), que também é mandado pra
-   OnyxPag em metadata.order_id — ela devolve isso como "external_ref" (na
-   criação) ou "external_id" (no webhook), então sempre conseguimos religar
-   a transação da OnyxPag ao nosso pedido, mesmo depois de um restart. */
-const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved"]);
-const FAILED_STATUSES = new Set(["expirado", "expired", "cancelado", "canceled", "cancelled"]);
-const ordersById = new Map();   // orderId (MBS...)      -> rec
-const ordersByTxId = new Map(); // transactionId (PXB_...) -> rec
-// A resposta GET /transactions/{id} da OnyxPag NÃO devolve o external_ref/
-// metadata, então religamos a transação ao nosso pedido por esse índice.
+   (prefixo "MBS" = Mini Bike Sênior). A Adex IGNORA o external_id que a
+   gente manda na criação e devolve o dela própria (um UUID aleatório) —
+   então, diferente da OnyxPag, não dá pra religar a transação ao pedido
+   por nenhum campo que a Adex devolva. A única religação confiável é pelo
+   ID DA TRANSAÇÃO QUE A PRÓPRIA ADEX GERA na criação (tx.id), guardado
+   aqui em ordersByTxId. */
+const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved", "completed", "concluido", "concluído"]);
+const FAILED_STATUSES = new Set(["expirado", "expired", "cancelado", "canceled", "cancelled", "failed"]);
+const ordersById = new Map();   // orderId (MBS...)            -> rec
+const ordersByTxId = new Map(); // transactionId (da Adex)     -> rec
 
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -96,7 +94,7 @@ async function sendUtmifyOrder(rec, status, approvedDate = null) {
   const t = rec.tracking || {};
   const payload = {
     orderId: rec.orderId,
-    platform: "OnyxPag",
+    platform: "Adex",
     paymentMethod: "pix",
     status,
     createdAt: rec.createdAt || utmifyDate(),
@@ -160,57 +158,50 @@ async function sendUtmifyOrder(rec, status, approvedDate = null) {
   }
 }
 
-// Consulta a transação DIRETO na OnyxPag, com nossas próprias credenciais.
+// Consulta a transação DIRETO na Adex, com nossas próprias credenciais.
 // É a única fonte de verdade sobre status de pagamento — o webhook (abaixo)
-// não tem assinatura pra validar, então ele só dispara essa consulta em vez
-// de ser confiado diretamente. Retorna null se não achar/erro.
-async function fetchOnyxpagTransaction(transactionId) {
-  // A consulta de status é por PATH: GET /transactions/{id}  (não é ?id=).
-  // Resposta: { success: true, data: { id, status, amount, paid_at, expires_at? ... } }
-  // status vem em português: "pendente" | "pago" | "expirado" | "cancelado".
-  const r = await fetch(`${ONYXPAG_BASE}/transactions/${encodeURIComponent(transactionId)}`, {
-    headers: { Authorization: onyxpagAuthHeader() },
+// só dispara essa consulta em vez de ser confiado diretamente, mesmo tendo
+// assinatura válida. Retorna null se não achar/erro.
+async function fetchAdexTransaction(transactionId) {
+  const r = await fetch(`${ADEX_BASE}/pix-receive?transaction_id=${encodeURIComponent(transactionId)}`, {
+    headers: adexAuthHeaders(),
     signal: AbortSignal.timeout(10_000),
   });
   const body = await r.json().catch(() => null);
-  if (!r.ok || !body?.success || !body?.data) {
-    console.error("[onyxpag] falha ao consultar transação", transactionId, r.status, JSON.stringify(body).slice(0, 500));
+  console.log("[adex] DEBUG resposta bruta da consulta de status:", JSON.stringify(body).slice(0, 800)); // TEMP — remover após validar no teste de R$1
+  if (!r.ok || !body?.transaction) {
+    console.error("[adex] falha ao consultar transação", transactionId, r.status, JSON.stringify(body).slice(0, 500));
     return null;
   }
-  return body.data;
+  return body.transaction;
 }
 
-// Depois de confirmar (via fetchOnyxpagTransaction) que uma transação está
-// paga de verdade, avisa a UTMify. Reconstrói o registro pelo external_ref
-// se o pedido não estiver mais em memória (restart no meio do checkout).
+// Depois de confirmar (via fetchAdexTransaction) que uma transação está paga
+// de verdade, avisa a UTMify. NÃO usamos tx.external_ref/tx.external_id pra
+// religar — pra Adex isso é o UUID aleatório dela própria, não o nosso
+// orderId (ver comentário lá em cima). Só o hint explícito (quando temos) ou
+// o índice por tx.id servem de religação confiável.
 async function handleConfirmedStatus(tx, hintOrderId = null) {
   if (!tx) return;
-  const orderId = hintOrderId || tx.external_ref || tx.external_id || null;
-  // 1) pelo nosso orderId (hint do webhook ou external_ref)  2) pelo id da
-  //    transação da OnyxPag (índice local)  3) reconstrói só com o que a
-  //    OnyxPag devolveu (restart no meio do checkout).
+  const orderId = hintOrderId || null;
   let rec = (orderId && ordersById.get(orderId)) || (tx.id && ordersByTxId.get(tx.id)) || null;
   if (!rec && orderId) {
+    // Só acontece se o processo reiniciou e perdemos o índice em memória —
+    // reconstrói com o que a Adex devolveu, pra não deixar de reportar a venda.
     rec = {
       orderId,
       createdAt: tx.created_at || utmifyDate(),
       ts: Date.now(),
-      product: tx.items?.[0]?.title || "Mini Bike Ergométrica Sênior",
+      product: "Mini Bike Ergométrica Sênior",
       amountCents: Math.round(parseFloat(tx.amount || "0") * 100),
-      customer: {
-        name: tx.customer?.name || "",
-        email: tx.customer?.email || "",
-        phone: onlyDigits(tx.customer?.phone) || null,
-        document: onlyDigits(tx.customer?.document) || null,
-        ip: null,
-      },
+      customer: { name: "", email: "", phone: null, document: null, ip: null },
       tracking: {},
       utmifySent: new Set(),
     };
     ordersById.set(orderId, rec);
   }
   if (!rec) {
-    console.warn("[onyxpag] status confirmado sem conseguir religar ao pedido", tx.id);
+    console.warn("[adex] status confirmado sem conseguir religar ao pedido (tx.id não está em ordersByTxId — provável restart)", tx.id);
     return;
   }
 
@@ -222,34 +213,65 @@ async function handleConfirmedStatus(tx, hintOrderId = null) {
   }
 }
 
-// Webhook da OnyxPag. ATENÇÃO: a doc da OnyxPag não define nenhuma
-// assinatura/HMAC pra provar que a chamada veio mesmo dela — então NUNCA
-// confiamos direto no "status" que vier no corpo. Usamos o webhook só como
-// aviso pra ir conferir; quem decide é sempre a consulta autenticada acima.
-app.post("/api/webhooks/onyxpag", async (req, res) => {
+// Valida a assinatura HMAC-SHA256 do webhook da Adex:
+// header "x-webhook-signature: sha256=<hex>", calculada sobre
+// JSON.stringify(req.body) usando ADEX_SECRET_KEY.
+function verifyAdexSignature(req) {
+  const header = String(req.headers["x-webhook-signature"] || "");
+  const match = header.match(/^sha256=([0-9a-f]+)$/i);
+  if (!match || !process.env.ADEX_SECRET_KEY) return false;
+  try {
+    const expected = crypto
+      .createHmac("sha256", process.env.ADEX_SECRET_KEY)
+      .update(JSON.stringify(req.body))
+      .digest("hex");
+    const a = Buffer.from(match[1].toLowerCase(), "hex");
+    const b = Buffer.from(expected, "hex");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+// Webhook da Adex. Mesmo com assinatura válida, ele NUNCA decide status
+// sozinho — só dispara a consulta autenticada acima, que é quem manda.
+// Payload exato ainda não 100% confirmado (a doc não é confiável) — por
+// isso tenta vários caminhos pro id da transação e loga o corpo cru.
+app.post("/api/webhooks/adex", async (req, res) => {
   res.status(200).end(); // responde rápido; processa depois
 
-  const { event, data } = req.body || {};
-  const transactionId = data?.transaction_id || data?.id || null;
-  console.log("[onyxpag webhook]", event, { transactionId, external: data?.external_id });
-  if (!transactionId) return;
-
-  const tx = await fetchOnyxpagTransaction(transactionId);
-  if (!tx) {
-    console.warn("[onyxpag webhook] não confirmou a transação na consulta, ignorando", transactionId);
+  const validSig = verifyAdexSignature(req);
+  console.log("[adex webhook] recebido", { validSig, hasSecret: !!process.env.ADEX_SECRET_KEY });
+  console.log("[adex webhook] DEBUG corpo cru:", JSON.stringify(req.body).slice(0, 800)); // TEMP — remover após validar no teste de R$1
+  if (!validSig) {
+    console.warn("[adex webhook] assinatura ausente/inválida — ignorando (nada é decidido só pelo webhook mesmo)");
     return;
   }
-  await handleConfirmedStatus(tx, data?.external_id || null);
+
+  const data = req.body || {};
+  const transactionId = data?.transaction?.id || data?.data?.id || data?.id || data?.transaction_id || null;
+  if (!transactionId) {
+    console.warn("[adex webhook] não achou id de transação no payload, ignorando");
+    return;
+  }
+
+  const tx = await fetchAdexTransaction(transactionId);
+  if (!tx) {
+    console.warn("[adex webhook] não confirmou a transação na consulta, ignorando", transactionId);
+    return;
+  }
+  await handleConfirmedStatus(tx);
 });
 
 // Cria a cobrança Pix pro pedido
 app.post("/api/pay", async (req, res) => {
-  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
-    console.error("[onyxpag] ONYXPAG_PUBLIC_KEY/ONYXPAG_PRIVATE_KEY não configurados no ambiente");
+  if (!process.env.ADEX_PUBLIC_KEY || !process.env.ADEX_SECRET_KEY) {
+    console.error("[adex] ADEX_PUBLIC_KEY/ADEX_SECRET_KEY não configurados no ambiente");
     return res.status(500).json({ error: "server_misconfigured" });
   }
 
-  const { product, amountReais, customer, address, tracking, checkoutUrl } = req.body || {};
+  const { product, amountReais, customer, address, tracking } = req.body || {};
 
   const amountCents = Math.round(Number(amountReais) * 100);
   if (!Number.isInteger(amountCents) || amountCents < 100) return res.status(400).json({ error: "amount_invalid" });
@@ -269,10 +291,6 @@ app.post("/api/pay", async (req, res) => {
   if (!address?.cep || !address?.cidade || !address?.uf) {
     return res.status(400).json({ error: "address_invalid" });
   }
-  // source_url é obrigatório pra OnyxPag — precisa ser a página real do
-  // checkout (window.location.href do front), nunca um valor fixo.
-  const sourceUrl = String(checkoutUrl || "").trim();
-  if (!/^https?:\/\//i.test(sourceUrl)) return res.status(400).json({ error: "source_url_invalid" });
 
   const orderId = "MBS" + Date.now() + Math.random().toString(36).slice(2, 7);
   const createdAt = utmifyDate();
@@ -280,53 +298,70 @@ app.post("/api/pay", async (req, res) => {
   const t = tracking || {};
 
   try {
-    const r = await fetch(ONYXPAG_BASE, {
+    const r = await fetch(`${ADEX_BASE}/pix-receive`, {
       method: "POST",
       headers: {
-        Authorization: onyxpagAuthHeader(),
+        ...adexAuthHeaders(),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        // Valor total em REAIS (decimal) — a OnyxPag usa esse formato aqui,
-        // diferente de items[].unitPrice logo abaixo, que é em CENTAVOS.
+        // Valor total em REAIS (decimal) — confirmado que a Adex usa reais
+        // aqui de verdade, apesar da tabela de parâmetros da doc dizer
+        // "centavos". items[].unitPrice abaixo segue a mesma convenção
+        // (reais) por ora — CONFERIR no teste de R$1: se a Adex devolver
+        // fee_amount/net_amount muito diferentes do esperado, é sinal de
+        // que unitPrice precisa ser centavos. O valor cobrado de fato é
+        // sempre o campo "amount" top-level, então mesmo se isso estiver
+        // errado o cliente não é cobrado errado — só o item fica com
+        // descrição errada no painel da Adex.
         amount: Number((amountCents / 100).toFixed(2)),
-        payment_method: "pix",
-        source_url: sourceUrl,
-        source_label: product,
-        description: `${product} - Pedido ${orderId}`,
+        paymentMethod: "pix",
+        customer: {
+          name,
+          email,
+          phone,
+          document: { number: cpf, type: "cpf" },
+          address: {
+            zip: onlyDigits(address.cep),
+            street: address.rua || "",
+            number: address.numero || "s/n",
+            complement: address.complemento || "",
+            neighborhood: address.bairro || "",
+            city: address.cidade || "",
+            state: address.uf || "",
+          },
+        },
         items: [
           {
             title: product,
-            unitPrice: amountCents,
+            unitPrice: Number((amountCents / 100).toFixed(2)),
             quantity: 1,
             tangible: true, // false para produto digital
           },
         ],
-        customer: {
-          name,
-          email,
-          document: formatCPF(cpf),
-          phone,
-        },
-        postbackUrl: process.env.ONYXPAG_WEBHOOK_URL,
-        metadata: {
-          order_id: orderId,
-        },
+        postbackUrl: process.env.ADEX_WEBHOOK_URL,
+        // A Adex ignora isso e devolve um UUID próprio — mandamos mesmo
+        // assim só por clareza/log do lado dela; a religação real é feita
+        // por ordersByTxId (ver comentário lá em cima).
+        external_id: orderId,
       }),
       signal: AbortSignal.timeout(30_000),
     });
 
     const body = await r.json().catch(() => ({}));
-    if (!r.ok || !body?.success || !body?.data) {
-      console.error("[onyxpag] falha ao criar cobrança", r.status, JSON.stringify(body).slice(0, 800));
+    console.log("[adex] DEBUG resposta completa da criação:", JSON.stringify(body).slice(0, 1200)); // TEMP — remover após validar no teste de R$1
+
+    if (!r.ok || !body?.transaction || !body?.pix) {
+      console.error("[adex] falha ao criar cobrança", r.status, JSON.stringify(body).slice(0, 800));
       return res.status(502).json({ error: "gateway_error" });
     }
 
-    const pix = body.data;
-    console.log("[onyxpag] cobrança criada", { orderId, transactionId: pix.id, status: pix.status });
+    const tx = body.transaction;
+    const pix = body.pix;
+    console.log("[adex] cobrança criada", { orderId, transactionId: tx.id, status: tx.status });
 
-    // Endereço de entrega fica só com a gente — a OnyxPag não pede isso pra
-    // processar o Pix, mas precisamos guardar pra despachar o produto depois.
+    // Endereço de entrega fica só com a gente — a Adex não devolve isso pra
+    // gente reconsultar depois, mas precisamos guardar pra despachar o produto.
     const enderecoResumo = address
       ? `${address.rua || ""}, ${address.numero || "s/n"}` +
         (address.complemento ? ` - ${address.complemento}` : "") +
@@ -351,33 +386,36 @@ app.post("/api/pay", async (req, res) => {
         utm_content: t.utm_content || null,
         utm_term: t.utm_term || null,
       },
-      txId: pix.id,
+      txId: tx.id,
       utmifySent: new Set(),
     };
     ordersById.set(orderId, rec);
-    ordersByTxId.set(pix.id, rec);
+    ordersByTxId.set(tx.id, rec);
 
     sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
+    // Formato normalizado que o front já espera — não muda com a troca de gateway.
+    // A Adex não devolve imagem de QR pronta, só o copia-e-cola (o front já
+    // sabe gerar o QR a partir disso).
     return res.status(201).json({
-      pix_id: pix.id,
-      qr_code: pix.pix_code,
-      qr_code_image: pix.pix_qr_code || null,
-      expires_at: pix.expires_at,
+      pix_id: tx.id,
+      qr_code: pix.copyPaste,
+      qr_code_image: null,
+      expires_at: pix.expiresAt,
       order_id: orderId,
     });
   } catch (e) {
-    console.error("[onyxpag] exceção ao criar cobrança", e);
+    console.error("[adex] exceção ao criar cobrança", e);
     return res.status(500).json({ error: "internal" });
   }
 });
 
 // O frontend consulta esse endpoint a cada poucos segundos. É a fonte de
-// verdade principal (webhook sem assinatura só complementa, nunca decide
-// sozinho). Aceita ?id=<transaction id>.
+// verdade principal (webhook só complementa, nunca decide sozinho).
+// Aceita ?id=<transaction id, o mesmo "pix_id" devolvido por /api/pay>.
 app.get("/api/pix-status", async (req, res) => {
-  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
-    console.error("[onyxpag] ONYXPAG_PUBLIC_KEY/ONYXPAG_PRIVATE_KEY não configurados no ambiente");
+  if (!process.env.ADEX_PUBLIC_KEY || !process.env.ADEX_SECRET_KEY) {
+    console.error("[adex] ADEX_PUBLIC_KEY/ADEX_SECRET_KEY não configurados no ambiente");
     return res.status(500).json({ error: "server_misconfigured" });
   }
 
@@ -385,14 +423,14 @@ app.get("/api/pix-status", async (req, res) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
-    const tx = await fetchOnyxpagTransaction(id);
+    const tx = await fetchAdexTransaction(id);
     if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
 
     await handleConfirmedStatus(tx);
 
     return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
   } catch (e) {
-    console.error("[onyxpag] exceção ao consultar status", e);
+    console.error("[adex] exceção ao consultar status", e);
     return res.status(500).json({ error: "internal" });
   }
 });
@@ -400,9 +438,12 @@ app.get("/api/pix-status", async (req, res) => {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
-  console.log(`Backend Pix Mini Bike Ergométrica Sênior (OnyxPag + UTMify) rodando na porta ${PORT}`);
-  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
-    console.warn("⚠️  ONYXPAG_PUBLIC_KEY / ONYXPAG_PRIVATE_KEY não configurados.");
+  console.log(`Backend Pix Mini Bike Ergométrica Sênior (Adex + UTMify) rodando na porta ${PORT}`);
+  if (!process.env.ADEX_PUBLIC_KEY || !process.env.ADEX_SECRET_KEY) {
+    console.warn("⚠️  ADEX_PUBLIC_KEY / ADEX_SECRET_KEY não configurados.");
+  }
+  if (!process.env.ADEX_SECRET_KEY) {
+    console.warn("⚠️  Sem ADEX_SECRET_KEY, a assinatura do webhook não pode ser validada — todo webhook será ignorado (o polling continua funcionando normalmente).");
   }
   if (!process.env.UTMIFY_API_TOKEN) console.warn("⚠️  UTMIFY_API_TOKEN não configurado — vendas não vão pra UTMify.");
 });

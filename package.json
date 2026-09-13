@@ -1,7 +1,7 @@
 {
   "name": "checkout-backend",
   "version": "1.0.0",
-  "description": "Backend Pix (OnyxPag + UTMify) dedicado a uma oferta/funil",
+  "description": "Backend Pix (Adex + UTMify) dedicado a uma oferta/funil",
   "type": "module",
   "main": "server.js",
   "engines": {
